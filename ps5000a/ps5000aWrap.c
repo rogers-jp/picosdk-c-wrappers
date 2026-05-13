@@ -17,33 +17,123 @@
  *  Please refer to the PicoScope 5000 Series (A API) Programmer's Guide
  *  for descriptions of the underlying functions where stated.
  *
+ *  This wrapper supports up to PS5000A_WRAP_MAX_PICO_DEVICES PicoScope
+ *  5000A devices streaming simultaneously. Each device's state (ready,
+ *  buffers, channel counts, trigger flags, etc.) is held in a per-device
+ *  WRAP_DEVICE_INFO slot keyed by the driver handle. The caller MUST call
+ *  initWrapDevice(handle) once after ps5000aOpenUnit for each scope, and
+ *  releaseWrapDevice(handle) after ps5000aCloseUnit.
+ *
  * Copyright (C) 2013-2018 Pico Technology Ltd. See LICENSE file for terms.
  *
  **************************************************************************/
+
+#include <string.h>
 
 #include "ps5000aWrap.h"
 
  /////////////////////////////////
  //
- //	Variable definitions
+ //	Per-device state table
  //
  /////////////////////////////////
 
-int16_t		_ready = 0;
-int16_t		_autoStop = 0;
-uint32_t	_numSamples = 0;
-uint32_t	_triggeredAt = 0;
-int16_t		_triggered = FALSE;
-uint32_t	_startIndex = 0;				// Start index in driver data buffer
-int16_t		_overflow = 0;
+static WRAP_DEVICE_INFO _deviceInfo[PS5000A_WRAP_MAX_PICO_DEVICES];
+static uint16_t          _deviceCount = 0;
 
-int16_t		_channelCount = 0; // Should be set to 2 or 4 from the main application
-int16_t		_enabledChannels[PS5000A_MAX_CHANNELS] = { 0, 0, 0, 0 }; // Keep a record of the channels that are enabled
+// Find the slot for the given handle. Returns NULL if not found.
+static WRAP_DEVICE_INFO * findDevice(int16_t handle)
+{
+	int i;
 
-int16_t		_digitalPortCount = 0;																							// Should be set to 2 from the main application
-int16_t		_enabledDigitalPorts[PS5000A_WRAP_MAX_DIGITAL_PORTS] = { 0, 0 };		// Keep a record of the channels that are enabled
+	if (handle <= 0)
+	{
+		return NULL;
+	}
 
-WRAP_BUFFER_INFO _wrapBufferInfo;
+	for (i = 0; i < PS5000A_WRAP_MAX_PICO_DEVICES; i++)
+	{
+		if (_deviceInfo[i].handle == handle)
+		{
+			return &_deviceInfo[i];
+		}
+	}
+
+	return NULL;
+}
+
+/****************************************************************************
+* initWrapDevice
+*
+* Allocate a slot of per-device state for the given handle. Must be called
+* once per device, after ps5000aOpenUnit and before any other wrapper call
+* that uses that handle.
+****************************************************************************/
+extern PICO_STATUS PREF0 PREF1 initWrapDevice(int16_t handle)
+{
+	int i;
+
+	if (handle <= 0)
+	{
+		return PICO_INVALID_HANDLE;
+	}
+
+	// Already initialised? Reset its state but keep the slot.
+	for (i = 0; i < PS5000A_WRAP_MAX_PICO_DEVICES; i++)
+	{
+		if (_deviceInfo[i].handle == handle)
+		{
+			memset(&_deviceInfo[i], 0, sizeof(WRAP_DEVICE_INFO));
+			_deviceInfo[i].handle = handle;
+			return PICO_OK;
+		}
+	}
+
+	// Find a free slot.
+	for (i = 0; i < PS5000A_WRAP_MAX_PICO_DEVICES; i++)
+	{
+		if (_deviceInfo[i].handle == 0)
+		{
+			memset(&_deviceInfo[i], 0, sizeof(WRAP_DEVICE_INFO));
+			_deviceInfo[i].handle = handle;
+			_deviceCount++;
+			return PICO_OK;
+		}
+	}
+
+	return PICO_MAX_UNITS_OPENED;
+}
+
+/****************************************************************************
+* releaseWrapDevice
+*
+* Releases the per-device wrapper state for the given handle. Should be called
+* after ps5000aCloseUnit.
+****************************************************************************/
+extern PICO_STATUS PREF0 PREF1 releaseWrapDevice(int16_t handle)
+{
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
+
+	if (dev == NULL)
+	{
+		return PICO_INVALID_HANDLE;
+	}
+
+	memset(dev, 0, sizeof(WRAP_DEVICE_INFO));
+	if (_deviceCount > 0)
+	{
+		_deviceCount--;
+	}
+	return PICO_OK;
+}
+
+/****************************************************************************
+* getWrapDeviceCount
+****************************************************************************/
+extern uint16_t PREF0 PREF1 getWrapDeviceCount(void)
+{
+	return _deviceCount;
+}
 
 /////////////////////////////////
 //
@@ -58,7 +148,7 @@ WRAP_BUFFER_INFO _wrapBufferInfo;
 *
 ****************************************************************************/
 void PREF1 StreamingCallback(
-  int16_t handle,
+	int16_t handle,
 	int32_t noOfSamples,
 	uint32_t startIndex,
 	int16_t overflow,
@@ -69,79 +159,91 @@ void PREF1 StreamingCallback(
 {
 	int16_t channel = 0;
 	int16_t digitalPort = 0;
-	WRAP_BUFFER_INFO * _wrapBufferInfo = NULL;
-	
+	WRAP_DEVICE_INFO * dev = NULL;
+	WRAP_BUFFER_INFO * wrapBufferInfo = NULL;
+
 	if (pParameter != NULL)
 	{
-		_wrapBufferInfo = (WRAP_BUFFER_INFO *) pParameter;
+		dev = (WRAP_DEVICE_INFO *) pParameter;
+	}
+	else
+	{
+		dev = findDevice(handle);
 	}
 
-	_numSamples = noOfSamples;
-	_autoStop = autoStop;
-	_startIndex = startIndex;
+	if (dev == NULL)
+	{
+		return;
+	}
 
-	_triggered = triggered;
-	_triggeredAt = triggerAt;
+	wrapBufferInfo = &dev->wrapBufferInfo;
 
-	_overflow = overflow;
+	dev->numSamples = noOfSamples;
+	dev->autoStop = autoStop;
+	dev->startIndex = startIndex;
 
-	if (_wrapBufferInfo != NULL && noOfSamples)
+	dev->triggered = triggered;
+	dev->triggeredAt = triggerAt;
+
+	dev->overflow = overflow;
+
+	if (noOfSamples)
 	{
 		// Analogue channels
-		for (channel = (int16_t) PS5000A_CHANNEL_A; channel < _channelCount; channel++)
+		for (channel = (int16_t) PS5000A_CHANNEL_A; channel < dev->channelCount; channel++)
 		{
-			if (_enabledChannels[channel])
+			if (dev->enabledChannels[channel])
 			{
-				if (_wrapBufferInfo->appBuffers && _wrapBufferInfo->driverBuffers)
+				if (wrapBufferInfo->appBuffers && wrapBufferInfo->driverBuffers)
 				{
 					// Max buffers
-					if (_wrapBufferInfo->appBuffers[channel * 2]  && _wrapBufferInfo->driverBuffers[channel * 2])
+					if (wrapBufferInfo->appBuffers[channel * 2]  && wrapBufferInfo->driverBuffers[channel * 2])
 					{
-						memcpy_s (&_wrapBufferInfo->appBuffers[channel * 2][startIndex], noOfSamples * sizeof(int16_t),
-							&_wrapBufferInfo->driverBuffers[channel * 2][startIndex], noOfSamples * sizeof(int16_t));
+						memcpy_s(&wrapBufferInfo->appBuffers[channel * 2][startIndex], noOfSamples * sizeof(int16_t),
+							&wrapBufferInfo->driverBuffers[channel * 2][startIndex], noOfSamples * sizeof(int16_t));
 					}
 
 					// Min buffers
-					if (_wrapBufferInfo->appBuffers[channel * 2 + 1] && _wrapBufferInfo->driverBuffers[channel * 2 + 1])
+					if (wrapBufferInfo->appBuffers[channel * 2 + 1] && wrapBufferInfo->driverBuffers[channel * 2 + 1])
 					{
-						memcpy_s (&_wrapBufferInfo->appBuffers[channel * 2 + 1][startIndex], noOfSamples * sizeof(int16_t),
-							&_wrapBufferInfo->driverBuffers[channel * 2 + 1][startIndex], noOfSamples * sizeof(int16_t));
+						memcpy_s(&wrapBufferInfo->appBuffers[channel * 2 + 1][startIndex], noOfSamples * sizeof(int16_t),
+							&wrapBufferInfo->driverBuffers[channel * 2 + 1][startIndex], noOfSamples * sizeof(int16_t));
 					}
 				}
 			}
 		}
 
 		// Digital channels
-		if (_digitalPortCount > 0)
+		if (dev->digitalPortCount > 0)
 		{
 			// Use index 0 to indicate Digital Port 0
-			for (digitalPort = (int16_t)PS5000A_WRAP_DIGITAL_PORT0; digitalPort < _digitalPortCount; digitalPort++)
+			for (digitalPort = (int16_t)PS5000A_WRAP_DIGITAL_PORT0; digitalPort < dev->digitalPortCount; digitalPort++)
 			{
-				if (_enabledDigitalPorts[digitalPort])
+				if (dev->enabledDigitalPorts[digitalPort])
 				{
 					// Copy data...
-					if (_wrapBufferInfo->appDigiBuffers && _wrapBufferInfo->driverDigiBuffers)
+					if (wrapBufferInfo->appDigiBuffers && wrapBufferInfo->driverDigiBuffers)
 					{
 						// Max digital buffers
-						if (_wrapBufferInfo->appDigiBuffers[digitalPort * 2] && _wrapBufferInfo->driverDigiBuffers[digitalPort * 2])
+						if (wrapBufferInfo->appDigiBuffers[digitalPort * 2] && wrapBufferInfo->driverDigiBuffers[digitalPort * 2])
 						{
-								memcpy_s(&_wrapBufferInfo->appDigiBuffers[digitalPort * 2][startIndex], noOfSamples * sizeof(int16_t),
-										&_wrapBufferInfo->driverDigiBuffers[digitalPort * 2][startIndex], noOfSamples * sizeof(int16_t));
+							memcpy_s(&wrapBufferInfo->appDigiBuffers[digitalPort * 2][startIndex], noOfSamples * sizeof(int16_t),
+								&wrapBufferInfo->driverDigiBuffers[digitalPort * 2][startIndex], noOfSamples * sizeof(int16_t));
 						}
 
 						// Min digital buffers
-						if (_wrapBufferInfo->appDigiBuffers[digitalPort * 2 + 1] && _wrapBufferInfo->driverDigiBuffers[digitalPort * 2 + 1])
+						if (wrapBufferInfo->appDigiBuffers[digitalPort * 2 + 1] && wrapBufferInfo->driverDigiBuffers[digitalPort * 2 + 1])
 						{
-								memcpy_s(&_wrapBufferInfo->appDigiBuffers[digitalPort * 2 + 1][startIndex], noOfSamples * sizeof(int16_t),
-										&_wrapBufferInfo->driverDigiBuffers[digitalPort * 2 + 1][startIndex], noOfSamples * sizeof(int16_t));
+							memcpy_s(&wrapBufferInfo->appDigiBuffers[digitalPort * 2 + 1][startIndex], noOfSamples * sizeof(int16_t),
+								&wrapBufferInfo->driverDigiBuffers[digitalPort * 2 + 1][startIndex], noOfSamples * sizeof(int16_t));
 						}
 					}
 				}
 			}
 		}
 	}
-  
-  _ready = 1;
+
+	dev->ready = 1;
 }
 
 /****************************************************************************
@@ -152,7 +254,21 @@ void PREF1 StreamingCallback(
 ****************************************************************************/
 void PREF1 BlockCallback(int16_t handle, PICO_STATUS status, void * pParameter)
 {
-  _ready = 1;
+	WRAP_DEVICE_INFO * dev = NULL;
+
+	if (pParameter != NULL)
+	{
+		dev = (WRAP_DEVICE_INFO *) pParameter;
+	}
+	else
+	{
+		dev = findDevice(handle);
+	}
+
+	if (dev != NULL)
+	{
+		dev->ready = 1;
+	}
 }
 
 /****************************************************************************
@@ -161,80 +277,54 @@ void PREF1 BlockCallback(int16_t handle, PICO_STATUS status, void * pParameter)
 * This function starts collecting data in block mode without the requirement 
 * for specifying callback functions. Use the IsReady function in conjunction 
 * to poll the driver once this function has been called.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* preTriggerSamples - see noOfPreTriggerSamples in ps5000aRunBlock.
-* postTriggerSamples - see noOfPreTriggerSamples in ps5000aRunBlock.
-* timebase - see ps5000aRunBlock.
-* segmentIndex - see ps5000aRunBlock.
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 RunBlock(int16_t handle, int32_t preTriggerSamples, int32_t postTriggerSamples,
             uint32_t timebase, uint32_t segmentIndex)
 {
-	_ready = 0;
-	_numSamples = preTriggerSamples + postTriggerSamples;
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
 
-	return ps5000aRunBlock(handle, preTriggerSamples, postTriggerSamples, timebase, 
-		NULL, segmentIndex, BlockCallback, NULL);
+	if (dev == NULL)
+	{
+		return PICO_INVALID_HANDLE;
+	}
+
+	dev->ready = 0;
+	dev->numSamples = preTriggerSamples + postTriggerSamples;
+
+	return ps5000aRunBlock(handle, preTriggerSamples, postTriggerSamples, timebase,
+		NULL, segmentIndex, BlockCallback, dev);
 }
 
 /****************************************************************************
 * GetStreamingLatestValues
-*
-* facilitates communication with the driver to return the next block of 
-* values to your application when capturing data in streaming mode. Use with 
-* programming languages that do not support callback functions.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 GetStreamingLatestValues(int16_t handle)
 {
-	_ready = 0;
-	_numSamples = 0;
-	_autoStop = 0;
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
 
-	return ps5000aGetStreamingLatestValues(handle, StreamingCallback, &_wrapBufferInfo);
+	if (dev == NULL)
+	{
+		return PICO_INVALID_HANDLE;
+	}
+
+	dev->ready = 0;
+	dev->numSamples = 0;
+	dev->autoStop = 0;
+
+	return ps5000aGetStreamingLatestValues(handle, StreamingCallback, dev);
 }
 
 /****************************************************************************
 * AvailableData
-*
-* Returns the number of samples returned from the driver and shows 
-* the start index of the data in the buffer when collecting data in 
-* streaming mode.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* startIndex - on exit, an index to the first valid sample in the buffer 
-*				(When data is available).
-*
-* Returns:
-*
-* 0 - Data is not yet available.
-* Non-zero - the number of samples returned from the driver.
-*
 ****************************************************************************/
 extern uint32_t PREF0 PREF1 AvailableData(int16_t handle, uint32_t *startIndex)
 {
-	if ( _ready ) 
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
+
+	if (dev != NULL && dev->ready)
 	{
-		*startIndex = _startIndex;
-		return _numSamples;
+		*startIndex = dev->startIndex;
+		return dev->numSamples;
 	}
 
 	return 0;
@@ -242,128 +332,73 @@ extern uint32_t PREF0 PREF1 AvailableData(int16_t handle, uint32_t *startIndex)
 
 /****************************************************************************
 * AutoStopped
-*
-* Indicates if the device has stopped on collection of the number of samples 
-* specified in the call to the ps5000aRunStreaming function (if the 
-* ps5000aRunStreaming function's autostop flag is set).
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-*
-* Returns:
-*
-* Non-zero - if streaming has autostopped.
-*
 ****************************************************************************/
 extern int16_t PREF0 PREF1 AutoStopped(int16_t handle)
 {
-	if ( _ready) 
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
+
+	if (dev != NULL && dev->ready)
 	{
-		return _autoStop;
+		return dev->autoStop;
 	}
-	else
-	{
-		return 0;
-	}
+
+	return 0;
 }
 
 /****************************************************************************
 * IsReady
-*
-* This function is used to poll the driver to verify that data is ready to be 
-* received. The RunBlock or GetStreamingLatestValues function must have been 
-* called prior to calling this function.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-*
-* Returns:
-*
-* 0 - Data is not yet available.
-* Non-zero - Data is ready to be collected.
-*
 ****************************************************************************/
 extern int16_t PREF0 PREF1 IsReady(int16_t handle)
 {
-	return _ready;
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
+
+	if (dev == NULL)
+	{
+		return 0;
+	}
+
+	return dev->ready;
 }
 
 /****************************************************************************
 * IsTriggerReady
-*
-* Indicates whether a trigger has occurred when collecting data in streaming 
-* mode, and the location of the trigger point in the buffer.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* triggeredAt - on exit, the index of the sample in the buffer where the 
-* trigger occurred.
-*
-* Returns:
-*
-* 0 - The device has not triggered.
-* Non-zero - The device has been triggered.
-*
 ****************************************************************************/
 extern int16_t PREF0 PREF1 IsTriggerReady(int16_t handle, uint32_t *triggeredAt)
 {
-	if (_triggered)
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
+
+	if (dev == NULL)
 	{
-		*triggeredAt = _triggeredAt;
+		return 0;
 	}
 
-	return _triggered;
+	if (dev->triggered)
+	{
+		*triggeredAt = dev->triggeredAt;
+	}
+
+	return dev->triggered;
 }
 
 /****************************************************************************
 * ClearTriggerReady
-*
-* Clears the triggered and triggeredAt flags in relation to streaming mode 
-* capture.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-*
-* Returns:
-*
-* PICO_OK
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 ClearTriggerReady(int16_t handle)
 {
-	_triggeredAt = 0;
-	_triggered = FALSE;
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
+
+	if (dev == NULL)
+	{
+		return PICO_INVALID_HANDLE;
+	}
+
+	dev->triggeredAt = 0;
+	dev->triggered = FALSE;
 	return PICO_OK;
 }
 
 /****************************************************************************
-* SetTriggerConditions
-*
-* NOTE: This function is deprecated - use SetTriggerConditionsV2 instead.
-*
-* This function sets up trigger conditions on the scope's inputs. The trigger 
-* is defined by one or more sets of integers corresponding to 
-* PS5000A_TRIGGER_CONDITIONS structures which are then converted and passed 
-* to the ps5000aSetTriggerChannelConditions function.
-*
-* Use this function with programming languages that do not support structs.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* conditionsArray - an array of integer values specifying the conditions 
-*					for each channel.
-* nConditions - the number that will be passed after the wrapper code has 
-* created its structures. (i.e. the number of conditionsArray elements / 7)
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
+* SetTriggerConditions  (deprecated - use SetTriggerConditionsV2)
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 SetTriggerConditions(int16_t handle, int32_t *conditionsArray, int16_t nConditions)
 {
@@ -392,35 +427,7 @@ extern PICO_STATUS PREF0 PREF1 SetTriggerConditions(int16_t handle, int32_t *con
 }
 
 /****************************************************************************
-* SetTriggerProperties
-*
-* NOTE: This function is deprecated - use SetTriggerPropertiesV2 instead.
-* 
-* This function is used to enable or disable triggering and set its 
-* parameters by means of assigning the values from the propertiesArray to an 
-* array of TRIGGER_CHANNEL_PROPERTIES structures which are then passed to 
-* the ps5000aSetTriggerChannelProperties function with the other parameters.
-
-* Use this function with programming languages that do not support structs.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* propertiesArray - an array of sets of integers corresponding to 
-*					TRIGGER_CHANNEL_PROPERTIES structures describing the 
-*					required properties to be set. See also channelProperties
-*					in ps5000aSetTriggerChannelProperties.
-*
-* nProperties - the number that will be passed after the wrapper code has 
-*				created its structures. (i.e. the number of propertiesArray 
-*				elements / 6)
-* autoTrig - see autoTriggerMilliseconds in ps5000aSetTriggerChannelProperties.
-*
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
+* SetTriggerProperties  (deprecated - use SetTriggerPropertiesV2)
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 SetTriggerProperties(
 	int16_t handle, 
@@ -452,39 +459,7 @@ extern PICO_STATUS PREF0 PREF1 SetTriggerProperties(
 }
 
 /****************************************************************************
-* SetPulseWidthQualifier
-*
-* This function is used to enable pulse-width triggering and set 
-* its parameters by means of assigning the values from the pwqConditionsArray 
-* to an array of PS5000A_PWQ_CONDITIONS structures which are then passed to 
-* the ps5000aSetPulseWidthQualifier function with the other parameters.
-
-* Use this function with programming languages that do not support structs.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* pwqConditionsArray - an array of sets of integers corresponding to 
-*					PS5000A_PWQ_CONDITIONS structures describing the 
-*					required properties to be set. See also conditions
-*					in ps5000aSetPulseWidthQualifier.
-*
-* nConditions - the number that will be passed after the wrapper code has 
-*				created its structures. (i.e. the number of conditionsArray 
-*				elements / 6)
-*
-* direction - the direction of the signal required for the pulse width
-*				trigger to fire (See PS5000A_THRESHOLD_DIRECTION constants)
-* lower - the lower limit of the pulse-width counter with relation to
-			number of samples captured on the device.
-* upper - the upper limit of the pulse-width counter with relation to
-*			number of samples captured on the device.
-* type - the pulse-width type (see ps5000aSetPulseWidthQualifier).
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
+* SetPulseWidthQualifier  (deprecated)
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 SetPulseWidthQualifier(
 	int16_t handle,
@@ -523,42 +498,39 @@ extern PICO_STATUS PREF0 PREF1 SetPulseWidthQualifier(
 /****************************************************************************
 * setChannelCount
 *
-* Sets the number of analogue channels and digital ports on the device.  
-* copying data in the streaming callback.
-*
-* Input Arguments:
-*
-* handle - the device handle.
-* channelCount - not used.
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
+* Sets the number of analogue channels and digital ports on the device by
+* querying the model number.
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 setChannelCount(int16_t handle, int16_t channelCount)
 {
-  int8_t variant[15];
+	int8_t variant[15];
 	int16_t requiredSize = 0;
 	PICO_STATUS status = PICO_OK;
-	
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
+
+	if (dev == NULL)
+	{
+		return PICO_INVALID_HANDLE;
+	}
+
 	// Obtain the model number
 	status = ps5000aGetUnitInfo(handle, variant, sizeof(variant), &requiredSize, PICO_VARIANT_INFO);
-	
+
 	if (status == PICO_OK)
 	{
-			// Set the number of analogue channels
-			_channelCount = (int16_t) variant[1];
-			_channelCount = _channelCount - 48; // Subtract ASCII 0 (48)
+		// Set the number of analogue channels
+		dev->channelCount = (int16_t) variant[1];
+		dev->channelCount = dev->channelCount - 48; // Subtract ASCII 0 (48)
 
-			// Determine if the device is an MSO
-			if (strstr(variant, "MSO") != NULL)
-			{
-				 _digitalPortCount = 2;
-			}
-			else
-			{
-			  _digitalPortCount = 0;
-			}
+		// Determine if the device is an MSO
+		if (strstr((const char *)variant, "MSO") != NULL)
+		{
+			dev->digitalPortCount = 2;
+		}
+		else
+		{
+			dev->digitalPortCount = 0;
+		}
 	}
 
 	return status;
@@ -566,297 +538,178 @@ extern PICO_STATUS PREF0 PREF1 setChannelCount(int16_t handle, int16_t channelCo
 
 /****************************************************************************
 * setEnabledChannels
-*
-* Sets the number of enabled analogue channels on the device. This is used to 
-* assist with copying data in the streaming callback.
-*
-* Input Arguments:
-*
-* handle - the device handle.
-* enabledChannels - an array representing the channel states. This should be 
-*					4 elements in size.
-*
-* Returns:
-*
-* PICO_OK if successful,
-* PICO_INVALID_HANDLE if handle <= 0, or 
-* PICO_INVALID_PARAMETER if _channelCount is out of range
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 setEnabledChannels(int16_t handle, int16_t * enabledChannels)
 {
-	if (handle > 0)
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
+
+	if (dev == NULL)
 	{
-		if (_channelCount > 0 && _channelCount <= PS5000A_MAX_CHANNELS)
-		{
-			memcpy_s((int16_t *)_enabledChannels, PS5000A_MAX_CHANNELS * sizeof(int16_t), 
-				(int16_t *)enabledChannels, PS5000A_MAX_CHANNELS * sizeof(int16_t));
-			
-			return PICO_OK;
-		}
-		else
-		{
-		  return PICO_INVALID_PARAMETER;
-		}
+		return PICO_INVALID_HANDLE;
 	}
 
-	return PICO_INVALID_HANDLE;
+	if (dev->channelCount > 0 && dev->channelCount <= PS5000A_MAX_CHANNELS)
+	{
+		memcpy_s((int16_t *)dev->enabledChannels, PS5000A_MAX_CHANNELS * sizeof(int16_t),
+			(int16_t *)enabledChannels, PS5000A_MAX_CHANNELS * sizeof(int16_t));
+
+		return PICO_OK;
+	}
+
+	return PICO_INVALID_PARAMETER;
 }
 
 /****************************************************************************
 * setAppAndDriverBuffers
-*
-* Set the application and corresponding driver buffer in order for the 
-* streaming callback to copy the data for the channel/digital port from the 
-* driver buffer to the application buffer.
-*
-* Input Arguments:
-*
-* handle - the device handle.
-* channel - the channel/ digital port number (should be a PS5000A_CHANNEL 
-*						enumeration value).
-* appBuffer - the application buffer.
-* driverBuffer - the buffer set by the driver.
-* bufferLength - the length of the buffers (the length of the buffers must be
-*								equal).
-*
-* Returns:
-*
-* PICO_OK, if successful
-* PICO_INVALID_HANDLE, if an invalid handle is used, or 
-* PICO_INVALID_CHANNEL if an invalid channel/digital port is used, or
-* PICO_INVALID_PARAMETER if the bufferLength is less than or equal to 0.
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 setAppAndDriverBuffers(int16_t handle, PS5000A_CHANNEL channel, int16_t * appBuffer, int16_t * driverBuffer, uint32_t bufferLength)
 {
-  // Map port number to internal enumeration for MSO devices.
+	// Map port number to internal enumeration for MSO devices.
 	PS5000A_WRAP_DIGITAL_PORT_INDEX portIndex = PS5000A_WRAP_DIGITAL_PORT0;
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
 
-	if (handle > 0)
+	if (dev == NULL)
 	{
-		if (bufferLength <= 0)
+		return PICO_INVALID_HANDLE;
+	}
+
+	if (bufferLength <= 0)
+	{
+		return PICO_INVALID_PARAMETER;
+	}
+
+	if (channel == PS5000A_DIGITAL_PORT0 || channel == PS5000A_DIGITAL_PORT1)
+	{
+		if (channel == PS5000A_DIGITAL_PORT0)
 		{
-		  return PICO_INVALID_PARAMETER;
-		}
-
-		if (channel == PS5000A_DIGITAL_PORT0 || channel == PS5000A_DIGITAL_PORT1)
-		{
-				if (channel == PS5000A_DIGITAL_PORT0)
-				{
-					portIndex = PS5000A_WRAP_DIGITAL_PORT0;
-				}
-				else
-				{
-					portIndex = PS5000A_WRAP_DIGITAL_PORT1;
-				}
-
-				_wrapBufferInfo.appDigiBuffers[portIndex * 2] = appBuffer;
-				_wrapBufferInfo.driverDigiBuffers[portIndex * 2] = driverBuffer;
-
-				_wrapBufferInfo.digiBufferLengths[portIndex] = bufferLength;
-
-				return PICO_OK;
-		}
-		else if (channel < PS5000A_CHANNEL_A || channel >= PS5000A_MAX_CHANNELS)
-		{
-			return PICO_INVALID_CHANNEL;
+			portIndex = PS5000A_WRAP_DIGITAL_PORT0;
 		}
 		else
 		{
-			_wrapBufferInfo.appBuffers[channel * 2] = appBuffer;
-			_wrapBufferInfo.driverBuffers[channel * 2] = driverBuffer;
-				
-			_wrapBufferInfo.bufferLengths[channel] = bufferLength;
-
-			return PICO_OK;
+			portIndex = PS5000A_WRAP_DIGITAL_PORT1;
 		}
+
+		dev->wrapBufferInfo.appDigiBuffers[portIndex * 2] = appBuffer;
+		dev->wrapBufferInfo.driverDigiBuffers[portIndex * 2] = driverBuffer;
+
+		dev->wrapBufferInfo.digiBufferLengths[portIndex] = bufferLength;
+
+		return PICO_OK;
+	}
+	else if (channel < PS5000A_CHANNEL_A || channel >= PS5000A_MAX_CHANNELS)
+	{
+		return PICO_INVALID_CHANNEL;
 	}
 	else
 	{
-		return PICO_INVALID_HANDLE;
+		dev->wrapBufferInfo.appBuffers[channel * 2] = appBuffer;
+		dev->wrapBufferInfo.driverBuffers[channel * 2] = driverBuffer;
+
+		dev->wrapBufferInfo.bufferLengths[channel] = bufferLength;
+
+		return PICO_OK;
 	}
 }
 
 /****************************************************************************
 * setMaxMinAppAndDriverBuffers
-*
-* Set the application and corresponding driver buffers in order for the 
-* streaming callback to copy the data for the channel/digital port from the 
-* driver max and min buffers to the respective application buffers for 
-* aggregated data collection.
-*
-* Input Arguments:
-*
-* handle - the device handle.
-* channel - the channel/digital port number (should be a PS5000A_CHANNEL 
-*						enumeration value).
-* appMaxBuffer - the application max buffer.
-* appMinBuffer - the application min buffer.
-* driverMaxBuffer - the max buffer set by the driver.
-* driverMinBuffer - the min buffer set by the driver.
-* bufferLength - the length of the buffers (the length of the buffers must be
-*								equal).
-*
-* Returns:
-*
-* PICO_OK, if successful
-* PICO_INVALID_HANDLE, if an invalid handle is used, or
-* PICO_INVALID_CHANNEL if an invalid channel/digital port is used, or
-* PICO_INVALID_PARAMETER if the bufferLength is less than or equal to 0.
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 setMaxMinAppAndDriverBuffers(int16_t handle, PS5000A_CHANNEL channel, int16_t * appMaxBuffer, int16_t * appMinBuffer, int16_t * driverMaxBuffer, int16_t * driverMinBuffer, uint32_t bufferLength)
 {
 	// Map port number to internal enumeration for MSO devices.
 	PS5000A_WRAP_DIGITAL_PORT_INDEX portIndex = PS5000A_WRAP_DIGITAL_PORT0;
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
 
-	if (handle > 0)
+	if (dev == NULL)
 	{
-		if (bufferLength <= 0)
+		return PICO_INVALID_HANDLE;
+	}
+
+	if (bufferLength <= 0)
+	{
+		return PICO_INVALID_PARAMETER;
+	}
+
+	if (channel == PS5000A_DIGITAL_PORT0 || channel == PS5000A_DIGITAL_PORT1)
+	{
+		if (channel == PS5000A_DIGITAL_PORT0)
 		{
-				return PICO_INVALID_PARAMETER;
-		}
-
-		if (channel == PS5000A_DIGITAL_PORT0 || channel == PS5000A_DIGITAL_PORT1)
-		{
-				if (channel == PS5000A_DIGITAL_PORT0)
-				{
-						portIndex = PS5000A_WRAP_DIGITAL_PORT0;
-				}
-				else
-				{
-						portIndex = PS5000A_WRAP_DIGITAL_PORT1;
-				}
-
-				_wrapBufferInfo.appDigiBuffers[portIndex * 2] = appMaxBuffer;
-				_wrapBufferInfo.driverDigiBuffers[portIndex * 2] = driverMaxBuffer;
-
-				_wrapBufferInfo.appDigiBuffers[portIndex * 2 + 1] = appMinBuffer;
-				_wrapBufferInfo.driverDigiBuffers[portIndex * 2 + 1] = driverMinBuffer;
-
-				_wrapBufferInfo.digiBufferLengths[portIndex] = bufferLength;
-
-				return PICO_OK;
-		}
-		else if (channel < PS5000A_CHANNEL_A || channel >= PS5000A_MAX_CHANNELS)
-		{
-			return PICO_INVALID_CHANNEL;
+			portIndex = PS5000A_WRAP_DIGITAL_PORT0;
 		}
 		else
 		{
-			_wrapBufferInfo.appBuffers[channel * 2] = appMaxBuffer;
-			_wrapBufferInfo.driverBuffers[channel * 2] = driverMaxBuffer;
-
-			_wrapBufferInfo.appBuffers[channel * 2 + 1] = appMinBuffer;
-			_wrapBufferInfo.driverBuffers[channel * 2 + 1] = driverMinBuffer;
-
-			_wrapBufferInfo.bufferLengths[channel] = bufferLength;
-
-			return PICO_OK;
+			portIndex = PS5000A_WRAP_DIGITAL_PORT1;
 		}
+
+		dev->wrapBufferInfo.appDigiBuffers[portIndex * 2] = appMaxBuffer;
+		dev->wrapBufferInfo.driverDigiBuffers[portIndex * 2] = driverMaxBuffer;
+
+		dev->wrapBufferInfo.appDigiBuffers[portIndex * 2 + 1] = appMinBuffer;
+		dev->wrapBufferInfo.driverDigiBuffers[portIndex * 2 + 1] = driverMinBuffer;
+
+		dev->wrapBufferInfo.digiBufferLengths[portIndex] = bufferLength;
+
+		return PICO_OK;
+	}
+	else if (channel < PS5000A_CHANNEL_A || channel >= PS5000A_MAX_CHANNELS)
+	{
+		return PICO_INVALID_CHANNEL;
 	}
 	else
 	{
-		return PICO_INVALID_HANDLE;
+		dev->wrapBufferInfo.appBuffers[channel * 2] = appMaxBuffer;
+		dev->wrapBufferInfo.driverBuffers[channel * 2] = driverMaxBuffer;
+
+		dev->wrapBufferInfo.appBuffers[channel * 2 + 1] = appMinBuffer;
+		dev->wrapBufferInfo.driverBuffers[channel * 2 + 1] = driverMinBuffer;
+
+		dev->wrapBufferInfo.bufferLengths[channel] = bufferLength;
+
+		return PICO_OK;
 	}
 }
 
 /****************************************************************************
 * setEnabledDigitalPorts
-*
-* Set the number of enabled digital ports on the device. This is used to
-* assist with copying data in the streaming callback.
-*
-* This function does not need to be called for non-MSO models.
-*
-* Input Arguments:
-*
-* handle - the device handle.
-* enabledDigitalPorts - an array representing the digital port states. This
-*												must be 2 elements in size.
-*
-* Returns:
-*
-* PICO_OK, if successful
-* PICO_INVALID_HANDLE, if handle is less than or equal to 0
-* PICO_INVALID_PARAMETER, if _digitalPortCount is not 0 or 2
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 setEnabledDigitalPorts(int16_t handle, int16_t * enabledDigitalPorts)
 {
-		if (handle > 0)
-		{
-				if (_digitalPortCount == 0 || _digitalPortCount == PS5000A_WRAP_MAX_DIGITAL_PORTS)
-				{
-						memcpy_s((int16_t *) _enabledDigitalPorts, PS5000A_WRAP_MAX_DIGITAL_PORTS * sizeof(int16_t),
-								(int16_t *) enabledDigitalPorts, PS5000A_WRAP_MAX_DIGITAL_PORTS * sizeof(int16_t));
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
 
-						return PICO_OK;
-				}
-				else
-				{
-						return PICO_INVALID_PARAMETER;
-				}
-		}
-		else
-		{
-				return PICO_INVALID_HANDLE;
-		}
+	if (dev == NULL)
+	{
+		return PICO_INVALID_HANDLE;
+	}
+
+	if (dev->digitalPortCount == 0 || dev->digitalPortCount == PS5000A_WRAP_MAX_DIGITAL_PORTS)
+	{
+		memcpy_s((int16_t *) dev->enabledDigitalPorts, PS5000A_WRAP_MAX_DIGITAL_PORTS * sizeof(int16_t),
+			(int16_t *) enabledDigitalPorts, PS5000A_WRAP_MAX_DIGITAL_PORTS * sizeof(int16_t));
+
+		return PICO_OK;
+	}
+
+	return PICO_INVALID_PARAMETER;
 }
 
 /****************************************************************************
 * getOverflow
-*
-* Returns indication if there has been an overvoltage on one or more 
-* analogue inputs when collecting data in streaming mode.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* overflow - on exit, a set of flags that indicate whether an overvoltage 
-*						has occurred on any of the channels. It is a bit field with 
-*						bit 0 denoting channel A.
-*
-* Returns:
-*
-* PICO_OK, if successful, or
-* PICO_INVALID_HANDLE if handle is less than or equal to 0
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 getOverflow(int16_t handle, int16_t * overflow)
 {
-  if (handle > 0)
-	{
-		*overflow = _overflow;
-		return PICO_OK;
-	}
-	else
+	WRAP_DEVICE_INFO * dev = findDevice(handle);
+
+	if (dev == NULL)
 	{
 		return PICO_INVALID_HANDLE;
 	}
+
+	*overflow = dev->overflow;
+	return PICO_OK;
 }
 
 /****************************************************************************
 * SetTriggerConditionsV2
-*
-* This function sets up trigger conditions on the scope's inputs. The trigger
-* is defined by one or more sets of integers corresponding to
-* PS5000A_CONDITION structures which are then converted and passed
-* to the ps5000aSetTriggerChannelConditionsV2 function.
-*
-* Use this function with programming languages that do not support structs.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* conditionsArray - an array of integer values specifying the conditions
-*										for each channel.
-* nConditions - the number that will be passed after the wrapper code has
-*								created its structures (i.e. the number of conditionsArray 
-*								elements / 2). Set to 0 to switch off triggering.
-* info - see ps5000aSetTriggerChannelConditionsV2
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 SetTriggerConditionsV2(int16_t handle, int32_t *conditionsArray, int16_t nConditions, PS5000A_CONDITIONS_INFO info)
 {
@@ -882,27 +735,6 @@ extern PICO_STATUS PREF0 PREF1 SetTriggerConditionsV2(int16_t handle, int32_t *c
 
 /****************************************************************************
 * SetTriggerDirectionsV2
-*
-* This function sets the direction of the trigger for each channel. The 
-* directions are defined by one or more sets of integers corresponding to
-* PS5000A_DIRECTION structures which are then converted and passed to the 
-* ps5000aSetTriggerChannelDirectionsV2 function.
-*
-* Use this function with programming languages that do not support structs.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* directionsArray - an array of integer values specifying the directions
-*										for each channel.
-* nConditions - the number that will be passed after the wrapper code has
-*								created its structures (i.e. the number of directionsArray
-*								elements / 3). 
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 SetTriggerDirectionsV2(int16_t handle, int32_t * directionsArray, int16_t nDirections)
 {
@@ -929,32 +761,6 @@ extern PICO_STATUS PREF0 PREF1 SetTriggerDirectionsV2(int16_t handle, int32_t * 
 
 /****************************************************************************
 * SetTriggerPropertiesV2
-*
-* This function is used to enable or disable triggering and set its
-* parameters by means of assigning the values from the propertiesArray to an
-* array of PS5000A_TRIGGER_CHANNEL_PROPERTIES_V2 structures which are then 
-* passed to the ps5000aSetTriggerChannelPropertiesV2 function with the other
-* parameters.
-*
-* Use this function with programming languages that do not support structs.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* propertiesArray - an array of sets of integers corresponding to
-*					PS5000A_TRIGGER_CHANNEL_PROPERTIES_V2 structures describing the
-*					required properties to be set. See also channelProperties
-*					in ps5000aSetTriggerChannelPropertiesV2.
-*
-* nProperties - the number that will be passed after the wrapper code has
-*								created its structures. (i.e. the number of propertiesArray
-*								elements / 5)
-*
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 SetTriggerPropertiesV2(int16_t handle, int32_t *propertiesArray, int16_t nProperties)
 {
@@ -984,31 +790,6 @@ extern PICO_STATUS PREF0 PREF1 SetTriggerPropertiesV2(int16_t handle, int32_t *p
 
 /****************************************************************************
 * SetTriggerDigitalPortProperties
-*
-* This function is used to set the individual digital channels' trigger 
-* directions by means of assigning the values from the digitalDirections 
-* array to an array of PS5000A_DIGITAL_CHANNEL_DIRECTIONS structures 
-* which are then passed to the ps5000aSetTriggerDigitalPortProperties 
-* function with the other parameters.
-*
-* Use this function with programming languages that do not support structs.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* digitalDirections - an array of sets of integers corresponding to
-*											PS5000A_DIGITAL_CHANNEL_DIRECTIONS structures 
-*											describing the required properties to be set. See 
-*											also directions in ps5000aSetTriggerDigitalPortProperties.
-*
-* nDirections - the number that will be passed after the wrapper code has
-*								created its structures. (i.e. the number of 
-*								digitalDirections elements / 2)
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 SetTriggerDigitalPortProperties(int16_t handle, int32_t *digitalDirections, int16_t nDirections)
 {
@@ -1034,28 +815,6 @@ extern PICO_STATUS PREF0 PREF1 SetTriggerDigitalPortProperties(int16_t handle, i
 
 /****************************************************************************
 * SetPulseWidthQualifierConditions
-*
-* This function applies a condition to the pulse-width qualifier. The condition
-* is defined by one or more sets of integers corresponding to
-* PS5000A_CONDITION structures which are then converted and passed
-* to the ps5000aSetPulseWidthQualifierConditions function.
-*
-* Use this function with programming languages that do not support structs.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* pwqConditionsArray - an array of integer values specifying the conditions
-*										for each channel.
-* nConditions - the number that will be passed after the wrapper code has
-*								created its structures (i.e. the number of pwqConditionsArray
-*								elements / 2). Set to 0 to switch off the pulse-width qualifier.
-* info - see ps5000aSetPulseWidthQualifierConditions
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 SetPulseWidthQualifierConditions(int16_t handle, int32_t *pwqConditionsArray, int16_t nConditions, PS5000A_CONDITIONS_INFO info)
 {
@@ -1081,27 +840,6 @@ extern PICO_STATUS PREF0 PREF1 SetPulseWidthQualifierConditions(int16_t handle, 
 
 /****************************************************************************
 * SetPulseWidthQualifierDirections
-*
-* This function sets the direction ofor all trigger sources used with the 
-* pulse width qualifier. The directions are defined by one or more sets of 
-* integers corresponding to PS5000A_DIRECTION structures which are then 
-* converted and passed to the ps5000aSetPulseWidthQualifierDirections function.
-*
-* Use this function with programming languages that do not support structs.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* pwqDirectionsArray - an array of integer values specifying the directions
-*										for each channel.
-* nConditions - the number that will be passed after the wrapper code has
-*								created its structures (i.e. the number of pwqDirectionsArray
-*								elements / 3).
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 SetPulseWidthQualifierDirections(int16_t handle, int32_t * pwqDirectionsArray, int16_t nDirections)
 {
@@ -1128,31 +866,6 @@ extern PICO_STATUS PREF0 PREF1 SetPulseWidthQualifierDirections(int16_t handle, 
 
 /****************************************************************************
 * SetPulseWidthDigitalPortProperties
-*
-* This function is used to set the individual digital channels' pulse-width 
-* trigger directions by means of assigning the values from the digitalDirections
-* array to an array of PS5000A_DIGITAL_CHANNEL_DIRECTIONS structures
-* which are then passed to the ps5000aSetSetPulseWidthDigitalPortProperties
-* function with the other parameters.
-*
-* Use this function with programming languages that do not support structs.
-*
-* Input Arguments:
-*
-* handle - the handle of the required device.
-* pwqDigitalDirections - an array of sets of integers corresponding to
-*											PS5000A_DIGITAL_CHANNEL_DIRECTIONS structures
-*											describing the required properties to be set. See
-*											also directions in ps5000aSetPulseWidthDigitalPortProperties.
-*
-* nDirections - the number that will be passed after the wrapper code has
-*								created its structures. (i.e. the number of
-*								pwqDigitalDirections elements / 2)
-*
-* Returns:
-*
-* PICO_OK or other code from PicoStatus.h
-*
 ****************************************************************************/
 extern PICO_STATUS PREF0 PREF1 SetPulseWidthDigitalPortProperties(int16_t handle, int32_t *pwqDigitalDirections, int16_t nDirections)
 {

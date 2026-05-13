@@ -72,40 +72,46 @@ typedef enum enBOOL
 #define PS5000A_WRAP_MAX_DIGITAL_PORTS			2
 #define PS5000A_WRAP_MAX_DIGITAL_BUFFERS		4  // 4 - Port 0 Max/Min and Port 1 Max/Min
 
-/////////////////////////////////
-//
-//	Variable declarations
-//
-/////////////////////////////////
-
-extern int16_t		_ready;
-extern int16_t		_autoStop;
-extern uint32_t		_numSamples;
-extern uint32_t		_triggeredAt;
-extern int16_t		_triggered;
-extern uint32_t		_startIndex;				// Start index in driver data buffer
-extern int16_t		_overflow;
-
-extern int16_t		_channelCount; // Should be set to 2 or 4 from the main application
-extern int16_t		_enabledChannels[PS5000A_MAX_CHANNELS]; // Keep a record of the channels that are enabled
-
-extern int16_t		_digitalPortCount;																			// Should be set to 2 from the main application
-extern int16_t		_enabledDigitalPorts[PS5000A_WRAP_MAX_DIGITAL_PORTS];		// Keep a record of the channels that are enabled
+// Maximum number of PicoScope 5000A devices that can be controlled
+// simultaneously through this wrapper.
+#define PS5000A_WRAP_MAX_PICO_DEVICES			4
 
 typedef struct tWrapBufferInfo
 {
 	int16_t *driverBuffers[PS5000A_WRAP_MAX_CHANNEL_BUFFERS];					// The buffers registered with the driver
 	int16_t *appBuffers[PS5000A_WRAP_MAX_CHANNEL_BUFFERS];						// Application buffers to copy the driver data into
-	uint32_t bufferLengths[PS5000A_MAX_CHANNELS];											// Buffer lengths
+	uint32_t bufferLengths[PS5000A_MAX_CHANNELS];								// Buffer lengths
 
-																																		// Digital ports
-	int16_t *driverDigiBuffers[PS5000A_WRAP_MAX_DIGITAL_BUFFERS];			// The buffers registered with the driver for the digital ports
-	int16_t *appDigiBuffers[PS5000A_WRAP_MAX_DIGITAL_BUFFERS];				// Application buffers to copy the driver digital data into
-	uint32_t digiBufferLengths[PS5000A_WRAP_MAX_DIGITAL_BUFFERS];			// Buffer lengths for digital ports - only 2 ports.
+																				// Digital ports
+	int16_t *driverDigiBuffers[PS5000A_WRAP_MAX_DIGITAL_BUFFERS];				// The buffers registered with the driver for the digital ports
+	int16_t *appDigiBuffers[PS5000A_WRAP_MAX_DIGITAL_BUFFERS];					// Application buffers to copy the driver digital data into
+	uint32_t digiBufferLengths[PS5000A_WRAP_MAX_DIGITAL_BUFFERS];				// Buffer lengths for digital ports - only 2 ports.
 
 } WRAP_BUFFER_INFO;
 
-extern WRAP_BUFFER_INFO _wrapBufferInfo;
+// Per-device state. One instance is held per open PicoScope 5000A device,
+// so streaming/triggering state for each scope is independent. This is what
+// enables simultaneous streaming from multiple PicoScope 5000A devices via
+// this wrapper (for example from LabVIEW).
+typedef struct tWrapDeviceInfo
+{
+	int16_t  handle;									// 0 = slot unused
+	int16_t  ready;
+	int16_t  autoStop;
+	uint32_t numSamples;
+	uint32_t triggeredAt;
+	int16_t  triggered;
+	uint32_t startIndex;								// Start index in driver data buffer
+	int16_t  overflow;
+
+	int16_t  channelCount;								// 2 or 4
+	int16_t  enabledChannels[PS5000A_MAX_CHANNELS];
+
+	int16_t  digitalPortCount;							// 0 or 2
+	int16_t  enabledDigitalPorts[PS5000A_WRAP_MAX_DIGITAL_PORTS];
+
+	WRAP_BUFFER_INFO wrapBufferInfo;
+} WRAP_DEVICE_INFO;
 
 // Enum to define Digital Port indices
 typedef enum enPS5000AWrapDigitalPortIndex
@@ -119,6 +125,24 @@ typedef enum enPS5000AWrapDigitalPortIndex
 //	Function declarations
 //
 /////////////////////////////////
+
+// Multi-device support: must be called once per device after ps5000aOpenUnit
+// so the wrapper can allocate a slot of per-device state for the given handle.
+// Returns PICO_OK, PICO_INVALID_HANDLE or PICO_MAX_UNITS_OPENED.
+extern PICO_STATUS PREF0 PREF1 initWrapDevice
+(
+	int16_t handle
+);
+
+// Releases the per-device wrapper state for the given handle. Should be called
+// after ps5000aCloseUnit. Returns PICO_OK or PICO_INVALID_HANDLE.
+extern PICO_STATUS PREF0 PREF1 releaseWrapDevice
+(
+	int16_t handle
+);
+
+// Returns the number of devices currently tracked by the wrapper.
+extern uint16_t PREF0 PREF1 getWrapDeviceCount(void);
 
 extern PICO_STATUS PREF0 PREF1 RunBlock
 (
